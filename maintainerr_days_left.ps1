@@ -23,6 +23,60 @@ if (-not $RUN_INTERVAL) {
     $RUN_INTERVAL = $RUN_INTERVAL * 60 # Convert minutes to seconds
 }
 
+# Define path for tracking collection state
+$CollectionStateFile = "$IMAGE_SAVE_PATH/current_collection_state.json"
+
+# Initialize collection state if the file does not exist
+if (-not (Test-Path -Path $CollectionStateFile)) {
+    @{} | ConvertTo-Json | Set-Content -Path $CollectionStateFile
+}
+
+function Load-CollectionState {
+    if (Test-Path -Path $CollectionStateFile) {
+        try {
+            $rawContent = Get-Content -Path $CollectionStateFile -Raw
+            Write-Host "Raw State File Content: $rawContent"
+
+            # Enforce parsing into a valid object
+            $state = $rawContent | ConvertFrom-Json -Depth 10
+
+            if ($state -eq $null) {
+                Write-Host "Warning: Parsed state is null. Initializing as empty."
+                return @{}
+            }
+
+            if ($state -is [PSCustomObject]) {
+                return $state.PSObject.Properties | ForEach-Object { @{ $_.Name = $_.Value } }
+            }
+
+            return $state
+        } catch {
+            Write-Warning "Failed to load or parse state file: $_. Initializing as empty."
+            return @{}
+        }
+    } else {
+        Write-Host "State file does not exist. Initializing as empty."
+        return @{}
+    }
+}
+
+function Save-CollectionState {
+    param (
+        [hashtable]$state
+    )
+    $stringKeyedState = @{}
+    foreach ($key in $state.Keys) {
+        $stringKeyedState["$key"] = $state[$key]
+    }
+    try {
+        $stringKeyedState | ConvertTo-Json -Depth 10 | Set-Content -Path $CollectionStateFile
+        Write-Host "Successfully saved state: $(ConvertTo-Json $stringKeyedState -Depth 10)"
+    } catch {
+        Write-Error "Failed to save state: $_"
+    }
+}
+
+
 # Function to get data from Maintainerr
 function Get-MaintainerrData {
     $response = Invoke-RestMethod -Uri $MAINTAINERR_URL -Method Get
@@ -39,7 +93,6 @@ function Calculate-Date {
         [int]$deleteAfterDays
     )
 
-    Write-Host "Attempting to parse date: $addDate"
     $deleteDate = $addDate.AddDays($deleteAfterDays)
     $daySuffix = switch ($deleteDate.Day) {
         1  { "st" }
@@ -55,13 +108,57 @@ function Calculate-Date {
     return $formattedDate
 }
 
-# Function to download the current poster
 function Download-Poster {
     param (
         [string]$posterUrl,
         [string]$savePath
     )
-    Invoke-WebRequest -Uri $posterUrl -OutFile $savePath -Headers @{"X-Plex-Token"=$PLEX_TOKEN}
+    try {
+        # Check if the file exists and meets minimum size requirements
+        if (-not (Test-Path -Path $savePath) -or (Get-Item -Path $savePath).Length -lt 1024) {
+            Write-Host "Downloading poster from: $posterUrl to: $savePath"
+
+            # Attempt to download the poster
+            Invoke-WebRequest -Uri $posterUrl -OutFile $savePath -Headers @{"X-Plex-Token"=$PLEX_TOKEN}
+
+            # Validate the downloaded file
+            if (-not (Test-Path -Path $savePath) -or (Get-Item -Path $savePath).Length -lt 1024) {
+                throw "Poster download failed or file is too small."
+            }
+
+            # Optionally, validate the file as an image
+            if (-not (Validate-Poster -filePath $savePath)) {
+                Write-Warning "Downloaded file at $savePath is not a valid image. Deleting file."
+                Remove-Item -Path $savePath -Force
+                throw "Invalid poster file format detected."
+            }
+
+            Write-Host "Successfully downloaded poster to: $savePath"
+        } else {
+            Write-Host "Poster already exists and meets size requirements at: $savePath"
+        }
+    } catch {
+        Write-Warning "Failed to download poster from $posterUrl to $savePath. Error: $_"
+        throw
+    }
+}
+
+# Function to revert to the original poster
+function Revert-ToOriginalPoster {
+    param (
+        [string]$plexId,
+        [string]$originalImagePath
+    )
+
+    if (-not (Test-Path -Path $originalImagePath)) {
+        Write-Warning "Original image not found for Plex ID: $plexId. Skipping revert."
+        return
+    }
+
+    Write-Host "Reverting Plex ID: $plexId to original poster."
+    $uploadUrl = "$PLEX_URL/library/metadata/$plexId/posters?X-Plex-Token=$PLEX_TOKEN"
+    $posterBytes = [System.IO.File]::ReadAllBytes($originalImagePath)
+    Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType "image/jpeg"
 }
 
 # Function to add overlay text to the poster
@@ -86,19 +183,16 @@ function Add-Overlay {
     $image = [System.Drawing.Image]::FromFile($imagePath)
     $graphics = [System.Drawing.Graphics]::FromImage($image)
 
-    # Get image dimensions
     $imageWidth = $image.Width
     $imageHeight = $image.Height
 
-    # Calculate scaling factors based on the image dimensions
-    $scaleFactor = $imageWidth / 1000  # Use a reference width of 1000px
+    $scaleFactor = $imageWidth / 1000  # Reference width of 1000px
     $scaledFontSize = [int]($fontSize * $scaleFactor)
     $scaledPadding = [int]($padding * $scaleFactor)
     $scaledBackRadius = [int]($backRadius * $scaleFactor)
     $scaledHorizontalOffset = [int]($horizontalOffset * $scaleFactor)
     $scaledVerticalOffset = [int]($verticalOffset * $scaleFactor)
 
-    # Load the custom font
     $privateFontCollection = New-Object System.Drawing.Text.PrivateFontCollection
     $privateFontCollection.AddFontFile($fontPath)
     $fontFamily = $privateFontCollection.Families[0]
@@ -107,10 +201,8 @@ function Add-Overlay {
     $brush = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($fontColor))
     $backBrush = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($backColor))
 
-    # Measure the text size
     $size = $graphics.MeasureString($text, $font)
 
-    # Calculate background dimensions based on text size and padding
     $backWidth = [int]($size.Width + $scaledPadding * 2)
     $backHeight = [int]($size.Height + $scaledPadding * 2)
 
@@ -128,7 +220,6 @@ function Add-Overlay {
         default { $y = $image.Height - $backHeight - $scaledVerticalOffset }
     }
 
-    # Draw the rounded rectangle background
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $path = New-Object System.Drawing.Drawing2D.GraphicsPath
     $path.AddArc($x, $y, $scaledBackRadius, $scaledBackRadius, 180, 90)
@@ -138,7 +229,6 @@ function Add-Overlay {
     $path.CloseFigure()
     $graphics.FillPath($backBrush, $path)
 
-    # Adjust the text position to account for ascent and descent
     $textX = $x + ($backWidth - $size.Width) / 2
     $textY = $y + ($backHeight - $size.Height) / 2
 
@@ -167,7 +257,6 @@ function Upload-Poster {
     $posterBytes = [System.IO.File]::ReadAllBytes($posterPath)
     Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType "image/jpeg"
 
-    # Delete the temp image after upload
     try {
         Remove-Item -Path $posterPath -ErrorAction Stop
         Write-Host "Deleted temporary file: $posterPath"
@@ -176,47 +265,149 @@ function Upload-Poster {
     }
 }
 
-# Main function to process the media items
+function Validate-Poster {
+    param (
+        [string]$filePath
+    )
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $image = [System.Drawing.Image]::FromFile($filePath)
+        $image.Dispose()
+        return $true
+    } catch {
+        Write-Warning "File at $filePath is not a valid image. Error: $_"
+        return $false
+    }
+}
+
+
+# Function to perform janitorial tasks: revert and delete unused posters
+function Janitor-Posters {
+    param (
+        [array]$mediaList,          # List of current Plex media GUIDs
+        [array]$maintainerrGUIDs,   # List of GUIDs in the Maintainerr collection
+        [hashtable]$newState,       # Current valid state from Process-MediaItems
+        [string]$originalImagePath, # Path to original poster images
+        [string]$collectionName     # Name of the collection for context/logging
+    )
+
+    Write-Host "Running janitorial logic for collection: $collectionName"
+
+    # Gather all downloaded posters
+    $downloadedPosters = Get-ChildItem -Path $originalImagePath -Filter "*.jpg" | ForEach-Object { $_.BaseName }
+
+    # GUIDs considered valid (in Plex, in Maintainerr, or in newState)
+    $validGUIDs = $mediaList + $maintainerrGUIDs + $newState.Keys
+
+    # GUIDs to handle
+    $unusedGUIDs = $downloadedPosters | Where-Object { $_ -notin $validGUIDs }
+    $revertGUIDs = $downloadedPosters | Where-Object { $_ -in $mediaList -and $_ -notin $maintainerrGUIDs }
+
+    # Revert posters for media still in Plex but no longer in Maintainerr
+    foreach ($guid in $revertGUIDs) {
+        $posterPath = Join-Path -Path $originalImagePath -ChildPath "$guid.jpg"
+        if (Test-Path -Path $posterPath) {
+            Write-Host "Reverting poster for GUID: $guid"
+            Revert-ToOriginalPoster -plexId $guid -originalImagePath $posterPath
+            Remove-Item -Path $posterPath -ErrorAction SilentlyContinue
+        } else {
+            Write-Warning "No poster file found to revert for GUID: $guid"
+        }
+    }
+
+    # Delete posters for media removed from Plex or no longer valid
+    foreach ($guid in $unusedGUIDs) {
+        $posterPath = Join-Path -Path $originalImagePath -ChildPath "$guid.jpg"
+        if (Test-Path -Path $posterPath) {
+            Write-Host "Deleting unused poster for GUID: $guid"
+            Remove-Item -Path $posterPath -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Process-MediaItems {
     $maintainerrData = Get-MaintainerrData
+    $currentState = Load-CollectionState
+
+    # Initialize new state
+    $newState = @{}
 
     foreach ($collection in $maintainerrData) {
+        Write-Host "Processing collection: $($collection.Name)"
         $deleteAfterDays = $collection.deleteAfterDays
 
         foreach ($item in $collection.media) {
-            $plexId = $item.plexId
-            $addDate = $item.addDate
-            
-            try {
-                $formattedDate = Calculate-Date -addDate $addDate -deleteAfterDays $deleteAfterDays
-            } catch {
-                Write-Error "Failed to parse date for media item ${plexId}: $_"
-                continue
-            }
-            
-            $posterUrl = "$PLEX_URL/library/metadata/$plexId/thumb?X-Plex-Token=$PLEX_TOKEN"
+            $plexId = $item.plexId.ToString()
             $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
             $tempImagePath = "$TEMP_IMAGE_PATH/$plexId.jpg"
+            $posterUrl = "$PLEX_URL/library/metadata/$plexId/thumb?X-Plex-Token=$PLEX_TOKEN"
+
+            # Add media item to new state
+            $newState[$plexId] = $true
+            Write-Host "Added to newState: Plex ID = $plexId, State = true"
 
             try {
-                # Check if original image already exists
+                # Ensure the original poster is downloaded first
                 if (-not (Test-Path -Path $originalImagePath)) {
+                    Write-Host "Original poster not found for Plex ID: $plexId. Downloading..."
                     Download-Poster -posterUrl $posterUrl -savePath $originalImagePath
+
+                    # Verify if the poster was successfully downloaded
+                    if (-not (Test-Path -Path $originalImagePath)) {
+                        throw "Failed to download original poster for Plex ID: $plexId"
+                    }
+                } else {
+                    Write-Host "Original poster already exists for Plex ID: $plexId."
                 }
 
-                # Copy the original image to the temp directory
-                Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
+                # Calculate the formatted date for overlay
+                $formattedDate = Calculate-Date -addDate $item.addDate -deleteAfterDays $deleteAfterDays
+                Write-Host "Item $plexId has a formatted date: $formattedDate"
 
-                # Apply overlay to the temp copy and get the updated path
-                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "Leaving $formattedDate" -fontColor $FONT_COLOR -backColor $BACK_COLOR -fontPath $FONT_PATH -fontSize $FONT_SIZE -padding $PADDING -backRadius $BACK_RADIUS -horizontalOffset $HORIZONTAL_OFFSET -horizontalAlign $HORIZONTAL_ALIGN -verticalOffset $VERTICAL_OFFSET -verticalAlign $VERTICAL_ALIGN
-                
-                # Upload the modified poster to Plex
+                # Apply overlay and upload the modified poster
+                Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
+                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "Leaving $formattedDate"
                 Upload-Poster -posterPath $tempImagePath -metadataId $plexId
             } catch {
-                Write-Error "Failed to process media item ${plexId}: $_"
+                Write-Warning "Failed to process Plex ID: $plexId. Error: $_"
             }
         }
     }
+
+    # Compare currentState with newState to identify removed items
+    foreach ($plexId in $currentState.Keys) {
+        if (-not $newState.ContainsKey($plexId)) {
+            Write-Host "Item $plexId detected as removed (not in newState)."
+            $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
+
+            # Revert to the original poster if it exists
+            if (Test-Path -Path $originalImagePath) {
+                Write-Host "Reverting Plex ID: $plexId to original poster."
+                Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
+            } else {
+                Write-Warning "Original poster not found for Plex ID: $plexId. Skipping revert."
+            }
+
+            # Mark as removed in the state
+            $newState[$plexId] = $false
+        } else {
+            Write-Host "Item $plexId is still in the collection."
+        }
+    }
+
+    # Run janitorial logic
+	$plexGUIDs = $currentState.Keys
+	$maintainerrGUIDs = $newState.Keys
+	Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
+
+
+    # Save the new state
+    $tempState = @{}
+    foreach ($key in $newState.Keys) {
+        $tempState["$key"] = $newState[$key]
+    }
+    Write-Host "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
+    Save-CollectionState -state $newState
 }
 
 # Ensure the images directories exist
