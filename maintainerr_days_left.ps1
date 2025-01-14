@@ -325,6 +325,67 @@ function Janitor-Posters {
     }
 }
 
+function Update-MediaLabels {
+    param (
+        [string]$plexId
+    )
+
+    # Ensure Plex host and token are set
+    if (-not $PLEX_URL -or -not $PLEX_TOKEN) {
+        Write-Host "Error: Plex URL or token not set. Cannot proceed."
+        return
+    }
+
+    # Construct the metadata URL for the media item
+    $metadataUrl = "$PLEX_URL/library/metadata/$plexId"+"?X-Plex-Token=$PLEX_TOKEN"
+
+    try {
+        # Fetch the metadata for the media item
+        $metadata = Invoke-RestMethod -Uri $metadataUrl -Method Get -ContentType "application/xml"
+    } catch {
+        Write-Warning "Error retrieving metadata for Plex ID: $plexId. URL: $metadataUrl. Error: $_"
+        return
+    }
+
+    # Initialize an empty array for current labels
+    $currentLabels = @()
+
+    # Extract existing labels from the metadata
+    if ($metadata.MediaContainer.Video.Label) {
+        $currentLabels = if ($metadata.MediaContainer.Video.Label -is [System.Array]) {
+            $metadata.MediaContainer.Video.Label | ForEach-Object { $_.tag }
+        } else {
+            @($metadata.MediaContainer.Video.Label.tag)
+        }
+    }
+
+    # Ensure case-insensitive comparison
+    $labelToRemove = "overlay"
+    $labelsToKeep = $currentLabels | Where-Object { $_.ToLower() -ne $labelToRemove.ToLower() }
+
+    # Construct parameters for updating labels
+    $removeLabelParam = "label[].tag.tag-=" + [System.Uri]::EscapeDataString($labelToRemove)
+    $addLabelsParams = $labelsToKeep | ForEach-Object { "label[$($labelsToKeep.IndexOf($_))].tag.tag=" + [System.Uri]::EscapeDataString($_) }
+    $params = @($removeLabelParam) + $addLabelsParams
+    $encodedLabelsString = $params -join "&"
+
+    # Construct the update URL (without locking the label field)
+    $updateUrl = "$PLEX_URL/library/metadata/$plexId"+"?X-Plex-Token=$PLEX_TOKEN&$encodedLabelsString"
+
+    try {
+        # Send the update request to Plex
+        $response = Invoke-RestMethod -Uri $updateUrl -Method Put
+        if ($response) {
+            Write-Host "Removed 'overlay' label and updated labels for Plex ID: $plexId"
+        } else {
+            Write-Warning "Plex API did not return a response for the update request."
+        }
+    } catch {
+        Write-Warning "Error updating labels for Plex ID: $plexId. URL: $updateUrl. Error: $_"
+    }
+}
+
+
 function Process-MediaItems {
     $maintainerrData = Get-MaintainerrData
     $currentState = Load-CollectionState
@@ -347,6 +408,9 @@ function Process-MediaItems {
             Write-Host "Added to newState: Plex ID = $plexId, State = true"
 
             try {
+                # Update the media labels (remove 'overlay' if present)
+                Update-MediaLabels -plexId $plexId
+
                 # Ensure the original poster is downloaded first
                 if (-not (Test-Path -Path $originalImagePath)) {
                     Write-Host "Original poster not found for Plex ID: $plexId. Downloading..."
@@ -396,10 +460,9 @@ function Process-MediaItems {
     }
 
     # Run janitorial logic
-	$plexGUIDs = $currentState.Keys
-	$maintainerrGUIDs = $newState.Keys
-	Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
-
+    $plexGUIDs = $currentState.Keys
+    $maintainerrGUIDs = $newState.Keys
+    Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
 
     # Save the new state
     $tempState = @{}
